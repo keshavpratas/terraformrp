@@ -1,0 +1,18 @@
+# By default, you MUST run `make build` first before running `docker-compose up`
+version: '3'
+services:
+  inventory:
+    image: inventory:0.4
+    depends_on:
+      - db
+    ports:
+      - "8080:8080"
+    env_file:
+      - ~/inventory.env
+  db:
+    image: mongo:latest
+    volumes:
+      - data-volume:/data/db
+
+volumes:
+  data-volume:
