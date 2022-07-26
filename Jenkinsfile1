@@ -1,0 +1,114 @@
+def ArtifactoryServer = Artifactory.server ''
+def SlackChannelsPass = [""]
+def SlackChannelsFail = [""]
+
+pipeline {
+  agent {
+    label {
+      label ""
+      customWorkspace "${JENKINS_HOME}/workspace/${JOB_BASE_NAME}-${BUILD_NUMBER}"
+    }
+  }
+  options {
+    timestamps()
+  }
+  environment {
+    VAULT_TOKEN = credentials('VAULT_TOKEN')
+    VAULT_TOKEN_DEV = credentials('VAULT_TOKEN_DEV')
+    VAULT_ADDR = ''
+    ANSIBLE_SSH = credentials('')
+    ANSIBLE_VAULT_PASSWORD_FILE = 'ansible_pw.txt'
+    AZURE_ANSIBLE_DATA = "${JENKINS_HOME}/workspace/azure_ansible_data"
+    ANSIBLE_DATA_DIR = "${JENKINS_HOME}/workspace/azure_ansible_data"
+    CAMP_TERRAFORM_DATA = "${WORKSPACE}/campaign-terraform"
+    RUNDECK_API_TOKEN = credentials('rundeck')
+    TF_PLUGIN_CACHE_DIR="${JENKINS_HOME}/.terraform.d/plugin-cache"
+  }
+  stages {
+    stage('Notify slack that a infrastructure provisioning is starting') {
+      steps {
+        script {
+          for (channel in SlackChannelsPass) {
+            slackSend (color: '#FFFF00', channel: "${channel}", message: "campaign-infrastructure-managment started for job ID ${JOB_BASE_NAME}-${BUILD_NUMBER}: :fingers_xed:")
+          }
+        }
+      }
+    }
+    stage('Generate Terraform config files')
+    {
+      steps {
+        sh '''
+           set +x
+           #source /opt/rh/rh-python36/enable
+           source /opt/rh/rh-py38/bin/activate
+           cd cfn-templates
+           git checkout -q  385b918f ## Not impacting any Azure provisioning - will revisit and remove this hardcoded value
+           cd ../
+           python generate_terraform_config.py --customer-env ${customer_env} --localfile ${localfile}
+        '''
+      }
+    }
+    stage('Terraform Infrastructure') {
+      steps {
+        sh '''
+           set +x
+           source /opt/rh/rh-py38/bin/activate
+           echo "Terraforming Infrastructure. There may be long pauses with no output."
+           alias terraform=/usr/local/bin/terraform-v12
+           [ -d ${TF_PLUGIN_CACHE_DIR} ] || mkdir -p ${TF_PLUGIN_CACHE_DIR}
+           python infra_service.py --apply
+        '''
+      }
+    }
+    stage('Archive terraform data to git') {
+      when {
+        environment name: 'TEST_PIPELINE_RUN', value: 'False'
+      }
+      steps {
+        sh '''
+           set +x
+           #source /opt/rh/rh-python36/enable
+           source /opt/rh/rh-py38/bin/activate
+           python archive_terraform_artifacts.py --customer-env ${customer_env} --localfile ${localfile}
+           cd ${CAMP_TERRAFORM_DATA}
+           git config --global user.email ""
+           git config --global user.name "Your Obedient Servant"
+           git checkout -b auto/${JOB_NAME}-${BUILD_NUMBER}
+           git branch --set-upstream-to=origin/master auto/${JOB_NAME}-${BUILD_NUMBER}
+           git pull
+           git add -A
+           git commit -m "Auto commit of campaign-infrastructure_management artifacts ${JOB_NAME} ${BUILD_NUMBER}"
+           git push origin HEAD:master
+        '''
+      }
+    }
+  }
+  post {
+    always {
+      sh '''
+         cp ${JENKINS_HOME}/jobs/${JOB_NAME}/builds/${BUILD_NUMBER}/log ${JOB_NAME}-${BUILD_NUMBER}.log
+      '''
+      archiveArtifacts artifacts: "${JOB_NAME}-${BUILD_NUMBER}.log", fingerprint: true
+      s3Upload consoleLogLevel: 'INFO', dontSetBuildResultOnFailure: false, dontWaitForConcurrentBuildCompletion: false, entries: [[bucket: 'camp-provisioning-logs/${JOB_NAME}', excludedFile: '', flatten: false, gzipFiles: false, keepForever: false, managedArtifacts: false, noUploadOnFailure: false, selectedRegion: 'us-west-1', showDirectlyInBrowser: false, sourceFile: '${JOB_NAME}-${BUILD_NUMBER}.log', storageClass: 'STANDARD', uploadFromSlave: false, useServerSideEncryption: false]], pluginFailureResultConstraint: 'FAILURE', profileName: 'artifactArchiver', userMetadata: []
+    }
+    success {
+      script {
+        for (channel in SlackChannelsPass) {
+          slackSend (color: '#00FF00', channel: "${channel}", message: "campaign-infrastructure-management successful for ${JOB_BASE_NAME}-${BUILD_NUMBER} :smile:")
+        }
+      }
+    }
+    failure {
+      script {
+        for (channel in SlackChannelsFail) {
+          slackSend (color: '#FF0000', channel: "${channel}", message: "campaign-infrastructure-management for ${JOB_BASE_NAME}-${BUILD_NUMBER} :sob: See: ${env.BUILD_URL} for errors")
+        }
+      }
+      sh '''
+         set +x
+         source /opt/rh/rh-py38/bin/activate
+         python ${WORKSPACE}/campaign-provisioning-utils/acss_payload.py --logfile $JENKINS_HOME/jobs/$JOB_NAME/builds/$BUILD_NUMBER/log --component '109206'  --issuetype 'Bug' --priority 'Normal' --customer-env ${customer_env} --localfile ${localfile}
+      '''
+    }
+  }
+}
